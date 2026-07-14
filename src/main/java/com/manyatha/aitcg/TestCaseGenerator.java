@@ -5,17 +5,32 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Map;
+import java.util.concurrent.Callable;
 import java.util.stream.Collectors;
 
 import com.google.genai.Client;
 import com.google.genai.errors.ServerException;
 import com.google.genai.types.GenerateContentResponse;
 
-public class TestCaseGenerator {
+import picocli.CommandLine;
+import picocli.CommandLine.Command;
+import picocli.CommandLine.Option;
 
-    private static final Path INPUT_FILE  = Paths.get("input", "user-story.txt");
-    private static final Path OUTPUT_FILE = Paths.get("output", "generated-tests.feature");
-    private static final String MODEL     = "gemini-flash-latest";
+@Command(name = "aitcg", mixinStandardHelpOptions = true, version = "1.0.0",
+        description = "Generate QA test cases from user stories using Google Gemini.")
+public class TestCaseGenerator implements Callable<Integer> {
+
+    @Option(names = {"-i", "--input"}, description = "Path to the user story file",
+            defaultValue = "input/user-story.txt")
+    private String inputFile;
+
+    @Option(names = {"-o", "--output"}, description = "Path to the output feature file",
+            defaultValue = "output/generated-tests.feature")
+    private String outputFile;
+
+    @Option(names = {"-m", "--model"}, description = "Gemini model to use",
+            defaultValue = "gemini-flash-latest")
+    private String model;
 
     private static final int MAX_RETRIES = 3;
     private static final long INITIAL_BACKOFF_MS = 2000;
@@ -36,60 +51,67 @@ public class TestCaseGenerator {
             1. Return ONLY valid Gherkin content — no markdown code blocks, no
                explanations, no preamble, no closing remarks.
             2. Start with "Feature:" line describing the functionality.
-            3. Each scenario should have a "Scenario:" line followed by
-               Given/When/Then steps.
-            4. Prefix each scenario name with its category in square brackets,
-               e.g., "[POSITIVE]", "[NEGATIVE]", "[BOUNDARY]", "[EDGE]".
-            5. Keep steps concrete and testable — avoid vague words like
-               "properly" or "correctly".
-            6. Cover ALL acceptance criteria mentioned in the user story.
+            3. Each scenario must have a clear, descriptive name.
+            4. Use Given/When/Then steps with realistic test data.
+            5. Tag each scenario: @positive, @negative, @boundary, or @edge.
 
             USER STORY:
-            ---
             {USER_STORY_HERE}
-            ---
-
-            Generate the Gherkin feature file now:
             """;
 
-    public static void main(String[] args) throws IOException {
-        System.out.println("=== AI Test Case Generator ===");
+    public static void main(String[] args) {
+        int exitCode = new CommandLine(new TestCaseGenerator()).execute(args);
+        System.exit(exitCode);
+    }
 
-        // 1. Read user story from disk
-        String userStory = readUserStory();
-        System.out.println("Read user story (" + userStory.length() + " chars) from " + INPUT_FILE);
+    @Override
+    public Integer call() throws Exception {
+        Path input = Paths.get(inputFile);
+        Path output = Paths.get(outputFile);
+
+        System.out.println("=== AI Test Case Generator ===");
+        System.out.println("Input:  " + input.toAbsolutePath());
+        System.out.println("Output: " + output.toAbsolutePath());
+        System.out.println("Model:  " + model);
+        System.out.println();
+
+        // 1. Read the user story
+        String userStory = readUserStory(input);
+        System.out.println("Read user story (" + userStory.length() + " chars) from " + input);
 
         // 2. Inject the story into the prompt template
         String prompt = PROMPT_TEMPLATE.replace("{USER_STORY_HERE}", userStory);
 
         // 3. Call Gemini
-        System.out.println("Calling Gemini (" + MODEL + ")... this may take a few seconds.");
+        System.out.println("Calling Gemini (" + model + ")... this may take a few seconds.");
         long start = System.currentTimeMillis();
         String gherkin = callGemini(prompt);
         double seconds = (System.currentTimeMillis() - start) / 1000.0;
         System.out.println("Received response in " + seconds + "s (" + gherkin.length() + " chars)");
 
         // 4. Write to output file
-        writeOutput(gherkin);
-        System.out.println("Wrote " + OUTPUT_FILE.toAbsolutePath());
+        writeOutput(output, gherkin);
+        System.out.println("Wrote " + output.toAbsolutePath());
 
-        // 5. Quick verification: how many scenarios did we actually get?
+        // 5. Quick verification
         long scenarioCount = gherkin.lines()
                 .filter(line -> line.trim().startsWith("Scenario:"))
                 .count();
         System.out.println();
         System.out.println("=== Summary ===");
         System.out.println("Scenarios generated: " + scenarioCount + " (expected 8)");
+
+        return 0;
     }
 
-    private static String readUserStory() throws IOException {
-        if (!Files.exists(INPUT_FILE)) {
-            throw new IOException("Input file not found: " + INPUT_FILE.toAbsolutePath()
-                    + " — make sure input/user-story.txt exists in the project root.");
+    private static String readUserStory(Path inputPath) throws IOException {
+        if (!Files.exists(inputPath)) {
+            throw new IOException("Input file not found: " + inputPath.toAbsolutePath()
+                    + " — make sure the file exists.");
         }
-        String content = Files.readString(INPUT_FILE).trim();
+        String content = Files.readString(inputPath).trim();
         if (content.isEmpty()) {
-            throw new IOException("Input file is empty: " + INPUT_FILE.toAbsolutePath());
+            throw new IOException("Input file is empty: " + inputPath.toAbsolutePath());
         }
         return content;
     }
@@ -105,7 +127,6 @@ public class TestCaseGenerator {
                 .map(line -> line.split("=", 2))
                 .filter(parts -> parts.length == 2)
                 .collect(Collectors.toMap(parts -> parts[0].trim(), parts -> parts[1].trim()));
-
         String key = env.get("GEMINI_API_KEY");
         if (key == null || key.isBlank()) {
             throw new IOException("GEMINI_API_KEY not found in .env file. "
@@ -114,9 +135,8 @@ public class TestCaseGenerator {
         return key;
     }
 
-    private static String callGemini(String prompt) throws IOException {
+    private String callGemini(String prompt) throws IOException {
         Client client = Client.builder().apiKey(loadApiKey()).build();
-
         ServerException lastError = null;
         long backoffMs = INITIAL_BACKOFF_MS;
 
@@ -124,12 +144,11 @@ public class TestCaseGenerator {
             try {
                 System.out.println("  Attempt " + attempt + " of " + MAX_RETRIES + "...");
                 GenerateContentResponse response =
-                        client.models.generateContent(MODEL, prompt, null);
+                        client.models.generateContent(model, prompt, null);
                 return response.text();
             } catch (ServerException e) {
                 lastError = e;
                 System.out.println("  Attempt " + attempt + " failed: " + e.getMessage());
-
                 if (attempt < MAX_RETRIES) {
                     System.out.println("  Waiting " + (backoffMs / 1000) + "s before retry...");
                     try {
@@ -142,13 +161,12 @@ public class TestCaseGenerator {
                 }
             }
         }
-
         throw new IOException("Gemini API call failed after " + MAX_RETRIES
                 + " attempts. Last error: " + lastError.getMessage(), lastError);
     }
 
-    private static void writeOutput(String content) throws IOException {
-        Files.createDirectories(OUTPUT_FILE.getParent());
-        Files.writeString(OUTPUT_FILE, content);
+    private static void writeOutput(Path outputPath, String content) throws IOException {
+        Files.createDirectories(outputPath.getParent());
+        Files.writeString(outputPath, content);
     }
 }
