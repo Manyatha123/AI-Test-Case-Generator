@@ -83,3 +83,6 @@ AI-Test-Case-Generator/
 - Jackson (JSON parsing)
 - Maven
 
+## Rate Limits
+
+This project uses Google Gemini's free tier API. Each user has their own quota (15 requests/minute, 1500 requests/day). The built-in retry logic with exponential backoff handles temporary failures automatically. If you hit rate limits, just wait a minute and rerun.
